@@ -36,7 +36,8 @@ class ResBlockA(nn.Module):
 
             x_channel = x.size(1)
             y_channel = y.size(1)
-            ch_res = (y_channel - x_channel)/2
+            # Use integer division to get an integer number of channels to pad
+            ch_res = (y_channel - x_channel) // 2
 
             pad = (0, 0, 0, 0, ch_res, ch_res)
             z = nn.functional.pad(z, pad=pad, mode="constant", value=0)

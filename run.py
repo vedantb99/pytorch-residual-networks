@@ -6,252 +6,203 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data import *
+from data import *   # Keep any other data imports if needed
 from models import *
 
 import torchvision
 from torchvision import transforms, utils
+from torchvision.datasets import CIFAR10
 from tensorboardX import SummaryWriter
 
 import pandas as pd
 
-# set device
+# Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 layer_n = int(sys.argv[1])
 
-ckpt_name = "checkpoints/ResNet-%d_cifar10.pth" %(layer_n*6+2)
-log_name = "./logs/ResNet-%d_cifar10_log/" %(layer_n*6+2)
+# Define checkpoint and log directory names based on the network depth.
+ckpt_name = "checkpoints/ResNet-%d_cifar10.pth" % (layer_n*6+2)
+log_name = "./logs/ResNet-%d_cifar10_log/" % (layer_n*6+2)
 
-#ckpt_name = "checkpoints/PlainNet-%d_cifar10.pth" %(layer_n*6+2)
-#log_name = "./logs/PlainNet-%d_cifar10_log/" %(layer_n*6+2)
+# Ensure the directories exist
+os.makedirs(os.path.dirname(ckpt_name), exist_ok=True)
+os.makedirs(log_name, exist_ok=True)
 
+# Data path for CIFAR10 (will be used for download if not available)
+data_path = '/data4/home/vedantb/datasets/cifar10'
+os.makedirs(data_path, exist_ok=True)
 
-batch_size = 100
+# Use a mini-batch size of 128
+batch_size = 128
 
 def train(cnn_model, start_epoch, train_loader, test_loader, lr, auto_lr=True):
-
-    # train model from scratch
-    num_epochs = 500
+    # Terminate training at 64k iterations
+    max_iter = 64000
 
     learning_rate = lr
-    print("lr: %f" %(learning_rate))
+    print("Initial learning rate: %f" % learning_rate)
     optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=0.0001)
-
     criterion = torch.nn.CrossEntropyLoss()
 
     train_writer = SummaryWriter(log_dir=log_name+'train')
     test_writer = SummaryWriter(log_dir=log_name+'test')
 
-    train_offset = 0
     train_iter = 0
-    for epc in range(num_epochs):
-
-        epoch = epc + start_epoch
-
-        train_total = 0
-        train_correct = 0
-
-        if (train_iter == 64000):
-            break
-
+    epoch = start_epoch
+    while train_iter < max_iter:
         for batch_idx, (data_x, data_y) in enumerate(train_loader):
+            # Check if we reached or exceeded max iterations
+            if train_iter >= max_iter:
+                break
 
-            train_iter = train_offset + epoch * len(train_loader) + batch_idx
-
-            if (auto_lr):
-                if (32000 == train_iter):
-                    learning_rate = learning_rate / 10.
-                    optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=0.0001)
-                
-                if (48000 == train_iter):
-                    learning_rate = learning_rate / 10.
-                    optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=0.0001)
-                
-                if (64000 == train_iter):
-                    learning_rate = learning_rate / 10.
-                    optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=0.0001)
-
-                if (train_iter == 64000):
-                    break
+            # Learning rate schedule:
+            if auto_lr:
+                if train_iter == 32000:
+                    learning_rate = lr / 10.
+                    optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate,
+                                                momentum=0.9, weight_decay=0.0001)
+                    print("Learning rate decayed to %f at iteration %d" % (learning_rate, train_iter))
+                if train_iter == 48000:
+                    learning_rate = lr / 100.
+                    optimizer = torch.optim.SGD(cnn_model.parameters(), lr=learning_rate,
+                                                momentum=0.9, weight_decay=0.0001)
+                    print("Learning rate decayed to %f at iteration %d" % (learning_rate, train_iter))
 
             data_x = data_x.to(device)
             data_y = data_y.to(device)
 
             optimizer.zero_grad()
-
             output = cnn_model(data_x)
-
             loss = criterion(output, data_y)
-                        
-            _, predicted = torch.max(output.data, 1)
 
-            train_total += batch_size
-            train_correct += (predicted == data_y).sum().item()
+            _, predicted = torch.max(output.data, 1)
+            batch_size_actual = data_y.size(0)
 
             loss.backward()
             optimizer.step()
 
-            if (train_iter % 10 == 0):
-                print("Epoch %d/%d, Step %d/%d, iter %d Loss: %f, lr: %f" \
-                     %(epoch, start_epoch+num_epochs, batch_idx, len(train_loader), train_iter, loss.item(), learning_rate))
-                train_writer.add_scalar('data/loss', loss, train_iter)
+            if train_iter % 10 == 0:
+                print("Epoch %d, Step %d/%d, iter %d, Loss: %f, lr: %f" \
+                     % (epoch, batch_idx, len(train_loader), train_iter, loss.item(), learning_rate))
+                train_writer.add_scalar('loss', loss.item(), train_iter)
 
-            if (train_iter % 100 == 0):
-                train_acc = float(train_correct) / train_total
-                print("iter %d, Train Accuracy: %f" %(train_iter, train_acc))
-                print("iter %d, Train correct/count: %d/%d" %(train_iter, train_correct, train_total))
-                train_writer.add_scalar('data/accuracy', train_acc, train_iter)
-                train_writer.add_scalar('data/error', 1.0-train_acc, train_iter)
-                train_total = 0
-                train_correct = 0
-
-            if (train_iter % 100 == 0):
+            # Every 100 iterations, evaluate on the test set
+            if train_iter % 100 == 0:
+                cnn_model.eval()
+                correct = 0
+                total = 0
+                loss_sum = 0.0
                 with torch.no_grad():
-                    correct = 0
-                    total = 0
-
-                    loss = 0
                     for test_batch_idx, (images, labels) in enumerate(test_loader):
                         images = images.to(device)
                         labels = labels.to(device)
-
                         outputs = cnn_model(images)
-                        loss += criterion(outputs.squeeze(), labels.squeeze())
-                        
-                        _, predicted = torch.max(outputs.data, 1)
+                        loss_sum += criterion(outputs, labels).item()
+                        _, predicted_test = torch.max(outputs.data, 1)
+                        total += labels.size(0)
+                        correct += (predicted_test == labels).sum().item()
+                avg_loss = loss_sum / len(test_loader)
+                test_acc = correct / total
+                print("iter %d, Test Accuracy: %f, Test Loss: %f" % (train_iter, test_acc, avg_loss))
+                test_writer.add_scalar('loss', avg_loss, train_iter)
+                test_writer.add_scalar('accuracy', test_acc, train_iter)
+                cnn_model.train()
 
-                        total += batch_size
-                        correct += (predicted == labels).sum().item()
-                    
-                    loss = float(loss) / len(test_loader)
-                    test_writer.add_scalar('data/loss', loss, train_iter)
+            train_iter += 1
 
-                    acc = float(correct)/total
-
-                    print("iter %d, Test Accuracy: %f" %(train_iter, acc))
-                    print("iter %d, Test avg Loss: %f" %(train_iter, loss))
-
-                    test_writer.add_scalar('data/accuracy', acc, train_iter)
-                    test_writer.add_scalar('data/error', 1.0-acc, train_iter)
-
-        # save models
-        state_dict = {"state": cnn_model.state_dict(), "epoch": epoch, "acc": acc, "lr": learning_rate}
+        epoch += 1
+        # Save a checkpoint at the end of each epoch
+        state_dict = {"state": cnn_model.state_dict(), "epoch": epoch, "lr": learning_rate}
         torch.save(state_dict, ckpt_name)
-        print("Model saved! %s" %(ckpt_name))
+        print("Checkpoint saved at epoch %d: %s" % (epoch, ckpt_name))
 
-
+    return cnn_model  # Return the final model
 
 def test(cnn_model, real_test_loader):
     labels = []
     ids = []
-
-    for batch_idx, (images, image_name) in enumerate(real_test_loader):
-        images = images.to(device)
-
-        outputs = cnn_model(images)
-
-        prob = torch.nn.functional.softmax(outputs.data)
-        prob = prob.data.tolist()
-        _, predicted = torch.max(outputs.data, 1)
-
-        print("batch %d/%d" %(batch_idx, len(real_test_loader)))
-
-        for name in image_name:
-            ids.append(os.path.basename(name).split('.')[0])
-
-        predicted = predicted.data.tolist()
-        for item in predicted:
-            labels.append(item)
-
+    cnn_model.eval()
+    with torch.no_grad():
+        for batch_idx, (images, image_name) in enumerate(real_test_loader):
+            images = images.to(device)
+            outputs = cnn_model(images)
+            prob = torch.nn.functional.softmax(outputs, dim=1).data.tolist()
+            _, predicted = torch.max(outputs.data, 1)
+            print("batch %d/%d" % (batch_idx, len(real_test_loader)))
+            for name in image_name:
+                ids.append(os.path.basename(name).split('.')[0])
+            predicted = predicted.data.tolist()
+            for item in predicted:
+                labels.append(item)
     submission = pd.DataFrame({'id': ids, 'label': labels})
     output_file_name = "submission.csv"
     submission.to_csv(output_file_name, index=False)
-    print("# %s generated!" %(output_file_name))
-
-
-   
-def weight_init(cnn_model):
-    ## offical usage:
-    # if type(cnn_model) == nn.Linear:
-    #    cnn_model.weight.data.fill_(1.0)
-    #    print(cnn_model.weight)
-
-    if isinstance(cnn_model, nn.Linear):
-        nn.init.xavier_normal_(cnn_model.weight)
-        nn.init.constant_(cnn_model.bias, 0)
-
-    elif isinstance(cnn_model, nn.Conv2d):
-        nn.init.kaiming_normal_(cnn_model.weight, mode='fan_out', nonlinearity='relu')
-
-    elif isinstance(cnn_model, nn.BatchNorm2d):
-        nn.init.constant_(cnn_model.weight, 1)
-        nn.init.constant_(cnn_model.bias, 0)
-
-
+    print("Submission saved at %s" % output_file_name)
 
 def main():
-    if (len(sys.argv) < 3):
+    if len(sys.argv) < 3:
         print("Error: usage: python main.py train/test!")
         exit(0)
     else:
-        # argv[1] for global layer_n
         mode = sys.argv[2]
+    print("Mode:", mode)
 
-    print(mode)
-
-    # enhance
-    # Use the torch.transforms, a package on PIL Image.
-    transform_enhanc_func = transforms.Compose([
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomCrop(32, padding=4, padding_mode='edge'),
+    # Data augmentation for training as specified:
+    # 4-pixel padding on each side, random 32x32 crop, and random horizontal flip.
+    transform_train = transforms.Compose([
+        transforms.Pad(4),
+        transforms.RandomCrop(32),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x.mul(255)),
         transforms.Normalize([125., 123., 114.], [1., 1., 1.])
-        ])
+    ])
 
-    # transform
-    transform_func = transforms.Compose([
+    # For testing, use the original 32x32 image.
+    transform_test = transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x.mul(255)),
         transforms.Normalize([125., 123., 114.], [1., 1., 1.])
-        ])
+    ])
 
-    # model create
+    # Create model
     model = ResNet(layer_n).to(device)
-    #model = PlainNet(layer_n).to(device)
+    # Use DataParallel if more than one GPU is available
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     print("Model created!")
 
     start_epoch = 0
     lr = 0.1
 
-    # model resume
-    if (os.path.exists(ckpt_name)):
+    # Resume model if checkpoint exists
+    if os.path.exists(ckpt_name):
         status_dict = torch.load(ckpt_name)
-        model_state = status_dict["state"]
-        start_epoch = status_dict["epoch"] + 1
-        acc = status_dict["acc"]
+        model.load_state_dict(status_dict["state"])
+        start_epoch = status_dict["epoch"]
         lr = status_dict["lr"]
-        model.load_state_dict(model_state)
-        print("Model loaded!")
+        print("Resuming model from checkpoint at epoch %d" % start_epoch)
 
-    # train
-    if (mode == 'train'):
-        train_data_path = '/home/chen/dataset/cifar10/cifar-10-batches-bin/train/'
-        test_data_path  = '/home/chen/dataset/cifar10/cifar-10-batches-bin/test/'
+    if mode == 'train':
+        # Use torchvision's CIFAR10 dataset
+        train_dataset = CIFAR10(root=data_path, train=True, download=True, transform=transform_train)
+        test_dataset = CIFAR10(root=data_path, train=False, download=True, transform=transform_test)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
 
-        train_data_ratio = 1.0
+        # Train the model until 64k iterations are reached.
+        model = train(model, start_epoch, train_loader, test_loader, lr, auto_lr=True)
 
-        test_dataset = Cifar10(test_data_path, True, False, train_data_ratio, transform_func)
-        test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
+        # Save the final model to a separate file.
+        final_ckpt = ckpt_name.replace('.pth', '_final.pth')
+        torch.save(model.state_dict(), final_ckpt)
+        print("Final model saved at %s" % final_ckpt)
 
-        train_dataset = Cifar10(train_data_path, True, False, train_data_ratio, transform_enhanc_func)
-        val_dataset = Cifar10(train_data_path, True, True,train_data_ratio, transform_func)
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=8)
-        val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
-
-        train(model, start_epoch, train_dataloader, test_dataloader, lr, True)
-
+    elif mode == 'test':
+        test_dataset = CIFAR10(root=data_path, train=False, download=True, transform=transform_test)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
+        test(model, test_loader)
 
 if __name__ == "__main__":
     main()
